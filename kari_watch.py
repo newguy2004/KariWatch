@@ -18,6 +18,7 @@ Uses only the Python standard library. Python 3.9+.
 Usage:
   python3 kari_watch.py                 # run forever: auto-checks + listens for commands
   python3 kari_watch.py --once          # one check, then exit (for cron / Task Scheduler)
+  python3 kari_watch.py --cloud         # one short run for GitHub Actions (answers commands + checks)
   python3 kari_watch.py --find-chat-id  # after you message your bot, prints your chat id
   python3 kari_watch.py --test-alert    # sends a test Telegram message
 
@@ -96,7 +97,7 @@ def fetch_slots(square_loc_id, guests, service=None, days=None):
             "endDate": (today + timedelta(days=days or DAYS_AHEAD)).isoformat(),
             "segments": [seg] * guests}
     try:
-        res = http_json(f"{BASE}/api/availability", body)
+        res = http_json(f"{BASE}/api/availability", body, timeout=15)
     except Exception as e:
         print(f"  ! request failed ({square_loc_id}, {guests} guests): {e}")
         return None
@@ -112,6 +113,7 @@ def fetch_slots(square_loc_id, guests, service=None, days=None):
         dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(MT)
         if dt > now:
             out.add(start)
+    print(f"  {square_loc_id} for {guests}: {len(out)} open", flush=True)
     return out
 
 
@@ -157,6 +159,7 @@ def check_once():
     first_run = prev is None
     prev = prev or {}
     state = {}
+    ok_any = False
     alerts = []  # (loc_name, loc_key, guests, start)
 
     for name, (key, sq_id) in LOCATIONS.items():
@@ -167,6 +170,7 @@ def check_once():
             if slots is None:            # request failed: keep what we knew, don't re-alert later
                 state[sk] = prev.get(sk, [])
                 continue
+            ok_any = True
             only_this = slots - found_higher   # a slot for 3 already covers 2
             state[sk] = sorted(only_this)
             for s in sorted(only_this - set(prev.get(sk, []))):
@@ -174,8 +178,13 @@ def check_once():
             found_higher |= slots
         time.sleep(1.5)
 
+    fails = 0 if ok_any else int(prev.get("_fails", 0)) + 1
+    state["_fails"] = fails
+    if fails == 6:
+        send_telegram("K-ARI watcher: the last 6 checks all failed. The site may be down or blocking "
+                      "this connection. I'll keep trying and go quiet until it works again.")
     save_state(state)
-    total = sum(len(v) for v in state.values())
+    total = sum(len(v) for k, v in state.items() if not k.startswith("_"))
     print(f"{datetime.now(MT):%a %H:%M} checked: {total} open slots, {len(alerts)} new")
 
     if alerts:
@@ -268,6 +277,55 @@ def poll_commands(offset, wait):
     return offset
 
 
+def answer_pending_commands():
+    """For cloud runs: answer any /check messages that arrived since the last run."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        ups = tg("getUpdates", {"timeout": 0, "allowed_updates": ["message"]}).get("result", [])
+    except Exception as e:
+        print(f"  ! couldn't read Telegram messages: {e}")
+        return
+    if not ups:
+        return
+    try:  # confirm them first so a slow reply can never cause the same command to run twice
+        tg("getUpdates", {"offset": ups[-1]["update_id"] + 1, "timeout": 0})
+    except Exception as e:
+        print(f"  ! couldn't confirm Telegram messages: {e}")
+    cutoff = time.time() - 3600  # ignore anything older than an hour
+    for u in ups:
+        m = u.get("message") or {}
+        if str(m.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+            continue
+        if m.get("date", 0) < cutoff:
+            continue
+        try:
+            handle_message(m.get("text", ""))
+        except Exception as e:
+            print(f"  ! command failed: {e}")
+
+
+class Deadline(BaseException):
+    """Raised by the safety timer; BaseException so no 'except Exception' can swallow it."""
+
+
+def cloud_run():
+    """One short run for GitHub Actions: answer pending commands, then check for new slots."""
+    import signal
+
+    def _stop(signum, frame):
+        raise Deadline("cloud run exceeded 200 seconds")
+
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _stop)
+        signal.alarm(200)
+    print("cloud run: reading Telegram commands", flush=True)
+    answer_pending_commands()
+    print("cloud run: checking K-ARI", flush=True)
+    check_once()
+    print("cloud run: done", flush=True)
+
+
 def find_chat_id():
     if not TELEGRAM_BOT_TOKEN:
         sys.exit("Set TELEGRAM_BOT_TOKEN first, then send your bot any message in Telegram.")
@@ -311,11 +369,17 @@ def run_forever():
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # so logs survive if the run is killed
+    except Exception:
+        pass
     args = set(sys.argv[1:])
     if "--find-chat-id" in args:
         return find_chat_id()
     if "--test-alert" in args:
         return send_telegram("K-ARI watcher test: alerts are working.")
+    if "--cloud" in args:
+        return cloud_run()
     if "--once" in args:
         return check_once()
     run_forever()
