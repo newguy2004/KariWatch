@@ -1,0 +1,44 @@
+name: K-ARI watcher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: kari-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore what was already seen
+        uses: actions/cache/restore@v4
+        with:
+          path: kari_seen.json
+          key: kari-state-${{ github.run_id }}
+          restore-keys: kari-state-
+
+      - name: Check K-ARI
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 kari_watch.py --cloud
+
+      - name: Save what was seen
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: kari_seen.json
+          key: kari-state-${{ github.run_id }}
